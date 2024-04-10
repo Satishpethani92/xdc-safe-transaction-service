@@ -31,22 +31,23 @@ CACHES = {
     }
 }
 
-# django-debug-toolbar
-# ------------------------------------------------------------------------------
-# https://django-debug-toolbar.readthedocs.io/en/latest/installation.html#prerequisites
-INSTALLED_APPS += ["debug_toolbar"]  # noqa F405
+# # django-debug-toolbar
+# # ------------------------------------------------------------------------------
+# # https://django-debug-toolbar.readthedocs.io/en/latest/installation.html#prerequisites
+# INSTALLED_APPS += ["debug_toolbar"]  # noqa F405
 
-# https://django-debug-toolbar.readthedocs.io/en/latest/installation.html#middleware
-MIDDLEWARE += [  # noqa F405
-    "debug_toolbar.middleware.DebugToolbarMiddleware",
-    "debug_toolbar_force.middleware.ForceDebugToolbarMiddleware",
-]
-# https://django-debug-toolbar.readthedocs.io/en/latest/configuration.html#debug-toolbar-config
-DEBUG_TOOLBAR_CONFIG = {
-    "DISABLE_PANELS": [
-        "debug_toolbar.panels.redirects.RedirectsPanel",
-    ],
-    "SHOW_TEMPLATE_CONTEXT": True,
-}
-# https://django-debug-toolbar.readthedocs.io/en/latest/installation.html#internal-ips
-INTERNAL_IPS = ["127.0.0.1", "10.0.2.2"]
+# # https://django-debug-toolbar.readthedocs.io/en/latest/installation.html#middleware
+# MIDDLEWARE += [  # noqa F405
+#     "debug_toolbar.middleware.DebugToolbarMiddleware",
+#     "debug_toolbar_force.middleware.ForceDebugToolbarMiddleware",
+# ]
+# # https://django-debug-toolbar.readthedocs.io/en/latest/configuration.html#debug-toolbar-config
+# DEBUG_TOOLBAR_CONFIG = {
+#     "DISABLE_PANELS": [
+#         "debug_toolbar.panels.redirects.RedirectsPanel",
+#         "debug_toolbar.panels.profiling.ProfilePanel",
+#     ],
+#     "SHOW_TEMPLATE_CONTEXT": True,
+# }
+# # https://django-debug-toolbar.readthedocs.io/en/latest/installation.html#internal-ips
+# INTERNAL_IPS = ["127.0.0.1", "10.0.2.2"]
