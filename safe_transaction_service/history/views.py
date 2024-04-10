@@ -110,6 +110,7 @@ class AboutEthereumRPCView(APIView):
     renderer_classes = (JSONRenderer,)
 
     def _get_info(self, ethereum_client: EthereumClient) -> Dict[str, Any]:
+        print("ethereum_client", ethereum_client)
         try:
             client_version = ethereum_client.w3.client_version
         except (IOError, ValueError):
@@ -1303,6 +1304,7 @@ class OwnersView(GenericAPIView):
         """
         Return Safes where the address provided is an owner
         """
+        print("addressssdsadasdasdsdasds", address)
         if not fast_is_checksum_address(address):
             return Response(
                 status=status.HTTP_422_UNPROCESSABLE_ENTITY,

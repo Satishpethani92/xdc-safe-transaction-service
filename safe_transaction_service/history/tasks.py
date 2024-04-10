@@ -60,6 +60,7 @@ def check_reorgs_task(self) -> Optional[int]:
     """
     :return: Number of the oldest block with reorg detected. `None` if not reorg found
     """
+    print("check_reorgs_task")
     with contextlib.suppress(LockError):
         with only_one_running_task(self):
             logger.info("Start checking of reorgs")
@@ -77,6 +78,7 @@ def check_sync_status_task() -> bool:
     """
     Check indexing status of the service
     """
+    print("check_sync_status_task")
     if not (is_service_synced := IndexServiceProvider().is_service_synced()):
         logger.error("Service is out of sync")
 
@@ -97,6 +99,7 @@ def index_erc20_events_task(self) -> Optional[Tuple[int, int]]:
 
     :return: Tuple Number of addresses processed, number of blocks processed
     """
+    print("index_erc20_events_task")
     with contextlib.suppress(LockError):
         with only_one_running_task(self):
             logger.info("Start indexing of erc20/721 events")
@@ -123,6 +126,7 @@ def index_erc20_events_out_of_sync_task(
 
     :return: Number of addresses processed
     """
+    print("index_erc20_events_out_of_sync_task")
     erc20_events_indexer = Erc20EventsIndexerProvider()
     if block_process_limit:
         erc20_events_indexer.block_process_limit = block_process_limit
@@ -180,7 +184,7 @@ def index_internal_txs_task(self) -> Optional[Tuple[int, int]]:
     Find and process internal txs for monitored addresses
     :return: Tuple of number of addresses processed and number of blocks processed
     """
-
+    print("index_internal_txs_task")
     with contextlib.suppress(LockError):
         with only_one_running_task(self):
             logger.info("Start indexing of internal txs")
@@ -207,6 +211,7 @@ def index_new_proxies_task(self) -> Optional[Tuple[int, int]]:
     """
     :return: Tuple of number of proxies created and number of blocks processed
     """
+    print("index_new_proxies_task")
     with contextlib.suppress(LockError):
         with only_one_running_task(self):
             logger.info("Start indexing of new proxies")
@@ -231,6 +236,7 @@ def index_safe_events_task(self) -> Optional[Tuple[int, int]]:
     Find and process for monitored addresses
     :return: Tuple of number of addresses processed and number of blocks processed
     """
+    print("index_safe_events_task")
 
     with contextlib.suppress(LockError):
         with only_one_running_task(self):
@@ -245,6 +251,7 @@ def index_safe_events_task(self) -> Optional[Tuple[int, int]]:
 
 @app.shared_task(bind=True, soft_time_limit=SOFT_TIMEOUT, time_limit=LOCK_TIMEOUT)
 def process_decoded_internal_txs_task(self) -> Optional[int]:
+    print("process_decoded_internal_txs_task")
     with contextlib.suppress(LockError):
         with only_one_running_task(self):
             count = 0
@@ -274,6 +281,7 @@ def reindex_mastercopies_last_hours_task(self, hours: float = 2.5) -> Optional[i
     """
     Reindexes last hours for master copies to prevent indexing issues
     """
+    print("reindex_mastercopies_last_hours_task")
     with contextlib.suppress(LockError):
         with only_one_running_task(self):
             if ethereum_block := EthereumBlock.objects.oldest_than(
@@ -301,6 +309,7 @@ def reindex_erc20_erc721_last_hours_task(self, hours: float = 2.5) -> Optional[i
     """
     Reindexes last hours for erx20 and erc721 to prevent indexing issues
     """
+    print("reindex_erc20_erc721_last_hours_task")
     with contextlib.suppress(LockError):
         with only_one_running_task(self):
             if ethereum_block := EthereumBlock.objects.oldest_than(
@@ -333,6 +342,7 @@ def reindex_master_copies_task(
     """
     Reindexes master copies
     """
+    print("reindex_master_copies_task")
     with contextlib.suppress(LockError):
         with only_one_running_task(
             self, lock_name_suffix=str(addresses) if addresses else None
@@ -359,6 +369,7 @@ def reindex_erc20_events_task(
     """
     Reindexes master copies
     """
+    print("reindex_erc20_events_task")
     with contextlib.suppress(LockError):
         with only_one_running_task(
             self, lock_name_suffix=str(addresses) if addresses else None
@@ -387,6 +398,7 @@ def process_decoded_internal_txs_for_safe_task(
     :param reindex_master_copies: Trigger auto reindexing if a problem is found
     :return:
     """
+    print("process_decoded_internal_txs_for_safe_task")
     with contextlib.suppress(LockError):
         with only_one_running_task(self, lock_name_suffix=safe_address):
             logger.info("[%s] Start processing decoded internal txs", safe_address)
@@ -505,6 +517,7 @@ def get_webhook_http_session(
 )
 @close_gevent_db_connection_decorator
 def send_webhook_task(address: Optional[str], payload: Dict[str, Any]) -> int:
+    print("send_webhook_task")
     if not (address and payload):
         return 0
 
@@ -575,7 +588,7 @@ def retry_get_metadata_task(
     :param address: collectible address
     :param token_id: collectible id
     """
-
+    print("retry_get_metadata_task")
     collectibles_service = CollectiblesServiceProvider()
     redis_key = collectibles_service.get_metadata_cache_key(address, token_id)
     redis = get_redis()
@@ -647,6 +660,7 @@ def retry_get_metadata_task(
 def remove_not_trusted_multisig_txs_task(
     time_delta: datetime.timedelta = datetime.timedelta(days=30),
 ) -> int:
+    print("remove_not_trusted_multisig_txs_task")
     logger.info("Deleting Multisig Transactions older than %s", time_delta)
     deleted, _ = (
         MultisigTransaction.objects.not_trusted()

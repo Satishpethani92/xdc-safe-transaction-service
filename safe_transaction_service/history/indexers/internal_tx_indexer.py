@@ -35,6 +35,7 @@ class InternalTxIndexerProvider:
     def get_new_instance(cls) -> "InternalTxIndexer":
         from django.conf import settings
 
+        print("index")
         if settings.ETH_INTERNAL_NO_FILTER:
             instance_class = InternalTxIndexerWithTraceBlock
         else:

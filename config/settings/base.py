@@ -391,12 +391,12 @@ LOGGING = {
         "LoggingMiddleware": {
             "handlers": ["console_short"],
             "level": "INFO",
-            "propagate": False,
+            "propagate": True,
         },
         "safe_transaction_service": {
             "level": "DEBUG" if DEBUG else "INFO",
             "handlers": ["console"],
-            "propagate": False,
+            "propagate": True,
         },
         "safe_transaction_service.history.services.balance_service": {
             "level": "DEBUG" if DEBUG else "WARNING",
@@ -404,15 +404,20 @@ LOGGING = {
         "safe_transaction_service.history.services.collectibles_service": {
             "level": "DEBUG" if DEBUG else "WARNING",
         },
+        "safe_transaction_service.history.tasks": {
+            "handlers": ["celery_console"],
+            "level": "DEBUG",
+            "propagate": True,
+        },
         "celery": {
             "handlers": ["console"],
             "level": "DEBUG" if DEBUG else "INFO",
-            "propagate": False,  # If not it will be out for the root logger too
+            "propagate": True,  # If not it will be out for the root logger too
         },
         "celery.worker.strategy": {  # All the "Received task..."
             "handlers": ["console"],
             "level": "INFO" if DEBUG else "WARNING",
-            "propagate": False,  # If not it will be out for the root logger too
+            "propagate": True,  # If not it will be out for the root logger too
         },
         "django.request": {
             "handlers": ["mail_admins"],
