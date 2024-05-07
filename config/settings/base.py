@@ -268,43 +268,43 @@ CELERY_ROUTES = (
     [
         (
             "safe_transaction_service.history.tasks.retry_get_metadata_task",
-            {"queue": "tokens", "delivery_mode": "transient"},
+            {"queue": "txdc_tokens", "delivery_mode": "transient"},
         ),
         (
             "safe_transaction_service.history.tasks.send_webhook_task",
-            {"queue": "webhooks", "delivery_mode": "transient"},
+            {"queue": "txdc_webhooks", "delivery_mode": "transient"},
         ),
         (
             "safe_transaction_service.events.tasks.send_event_to_queue_task",
-            {"queue": "webhooks", "delivery_mode": "transient"},
+            {"queue": "txdc_webhooks", "delivery_mode": "transient"},
         ),
         (
             "safe_transaction_service.history.tasks.reindex_mastercopies_last_hours_task",
-            {"queue": "indexing"},
+            {"queue": "txdc_indexing"},
         ),
         (
             "safe_transaction_service.history.tasks.reindex_erc20_erc721_last_hours_task",
-            {"queue": "indexing"},
+            {"queue": "txdc_indexing"},
         ),
         (
             "safe_transaction_service.history.tasks.*",
-            {"queue": "indexing", "delivery_mode": "transient"},
+            {"queue": "txdc_indexing", "delivery_mode": "transient"},
         ),
         (
             "safe_transaction_service.contracts.tasks.*",
-            {"queue": "contracts", "delivery_mode": "transient"},
+            {"queue": "txdc_contracts", "delivery_mode": "transient"},
         ),
         (
             "safe_transaction_service.notifications.tasks.*",
-            {"queue": "notifications", "delivery_mode": "transient"},
+            {"queue": "txdc_notifications", "delivery_mode": "transient"},
         ),
         (
             "safe_transaction_service.tokens.tasks.*",
-            {"queue": "tokens", "delivery_mode": "transient"},
+            {"queue": "txdc_tokens", "delivery_mode": "transient"},
         ),
         (
             "safe_transaction_service.analytics.tasks.*",
-            {"queue": "contracts", "delivery_mode": "transient"},
+            {"queue": "txdc_contracts", "delivery_mode": "transient"},
         ),
     ],
 )
