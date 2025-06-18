@@ -1,12 +1,12 @@
 import logging
-from typing import Callable, List, Optional
+from typing import Callable, Optional
 
 from django.core.paginator import Paginator
 from django.db import transaction
 
 from hexbytes import HexBytes
-
-from gnosis.eth import EthereumClient, EthereumClientProvider
+from safe_eth.eth import EthereumClient, get_auto_ethereum_client
+from safe_eth.util.util import to_0x_hex_str
 
 from ..indexers import (
     Erc20EventsIndexerProvider,
@@ -14,7 +14,13 @@ from ..indexers import (
     ProxyFactoryIndexerProvider,
     SafeEventsIndexerProvider,
 )
-from ..models import EthereumBlock, IndexingStatus, ProxyFactory, SafeMasterCopy
+from ..models import (
+    EthereumBlock,
+    IndexingStatus,
+    MultisigTransaction,
+    ProxyFactory,
+    SafeMasterCopy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +31,7 @@ class ReorgServiceProvider:
             from django.conf import settings
 
             cls.instance = ReorgService(
-                EthereumClientProvider(),
+                get_auto_ethereum_client(),
                 settings.ETH_REORG_BLOCKS,
                 settings.ETH_REORG_BLOCKS_BATCH,
             )
@@ -58,7 +64,7 @@ class ReorgService:
         self.eth_reorg_rewind_blocks = eth_reorg_rewind_blocks
 
         # List with functions for database models to recover from reorgs
-        self.reorg_functions: List[Callable[[int], int]] = [
+        self.reorg_functions: list[Callable[[int], int]] = [
             lambda block_number: ProxyFactory.objects.filter(
                 tx_block_number__gt=block_number
             ).update(tx_block_number=block_number),
@@ -109,6 +115,13 @@ class ReorgService:
             for database_block, blockchain_block in zip(
                 database_blocks, blockchain_blocks
             ):
+                if not blockchain_block:
+                    logger.error(
+                        "Block with number=%d cannot be retrieved from the RPC",
+                        database_block.number,
+                    )
+                    continue
+
                 if HexBytes(blockchain_block["hash"]) == HexBytes(
                     database_block.block_hash
                 ):
@@ -117,15 +130,15 @@ class ReorgService:
                         logger.debug(
                             "Block with number=%d and hash=%s is matching blockchain one, setting as confirmed",
                             database_block.number,
-                            HexBytes(blockchain_block["hash"]).hex(),
+                            to_0x_hex_str(HexBytes(blockchain_block["hash"])),
                         )
                         database_block.set_confirmed()
                 else:
                     logger.warning(
                         "Block with number=%d and hash=%s is not matching blockchain hash=%s, reorg found",
                         database_block.number,
-                        HexBytes(database_block.block_hash).hex(),
-                        HexBytes(blockchain_block["hash"]).hex(),
+                        to_0x_hex_str(HexBytes(database_block.block_hash)),
+                        to_0x_hex_str(HexBytes(blockchain_block["hash"])),
                     )
                     return database_block.number
 
@@ -164,6 +177,16 @@ class ReorgService:
         number_deleted_blocks, _ = EthereumBlock.objects.filter(
             number__gte=reorg_block_number
         ).delete()
+
+        # Fix multisig transactions that had EthereumBlock removed
+        # We will remove signature to don't remove not indexed data as origin.
+        # Index from reorg will fill signatures field again
+        # `failed` must be `NULL` in the database if `ethereum_tx` is empty
+        # `ethereum_tx` and `failed` both have a database index
+        MultisigTransaction.objects.filter(ethereum_tx=None).exclude(
+            failed=None
+        ).update(signatures=None, failed=None)
+
         logger.warning(
             "Reorg of block-number=%d fixed, indexing was reset to safe block=%d, %d elements updated and %d blocks deleted",
             reorg_block_number,

@@ -2,7 +2,7 @@ import json
 import operator
 import os
 from logging import getLogger
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
@@ -15,11 +15,10 @@ from botocore.exceptions import ClientError
 from cachetools import TTLCache, cachedmethod
 from imagekit.models import ProcessedImageField
 from pilkit.processors import Resize
+from safe_eth.eth.clients import ContractMetadata
+from safe_eth.eth.django.models import EthereumAddressBinaryField, Keccak256Field
+from safe_eth.eth.utils import fast_keccak
 from web3._utils.normalizers import normalize_abi
-
-from gnosis.eth.clients import ContractMetadata
-from gnosis.eth.django.models import EthereumAddressV2Field, Keccak256Field
-from gnosis.eth.utils import fast_keccak
 
 logger = getLogger(__name__)
 
@@ -39,7 +38,7 @@ def get_file_storage():
         return default_storage
 
 
-def validate_abi(value: Dict[str, Any]):
+def validate_abi(value: dict[str, Any]):
     try:
         if not value:
             raise ValueError("Empty ABI not allowed")
@@ -67,7 +66,7 @@ class ContractAbi(models.Model):
     def __str__(self):
         return f"ContractABI {self.relevance} - {self.description}"
 
-    def abi_functions(self) -> List[str]:
+    def abi_functions(self) -> list[str]:
         return [x["name"] for x in self.abi if x["type"] == "function"]
 
     def save(self, *args, **kwargs) -> None:
@@ -152,7 +151,7 @@ class ContractQuerySet(models.QuerySet):
 
 class Contract(models.Model):  # Known contract addresses by the service
     objects = ContractManager.from_queryset(ContractQuerySet)()
-    address = EthereumAddressV2Field(primary_key=True)
+    address = EthereumAddressBinaryField(primary_key=True)
     name = models.CharField(max_length=200, blank=True, default="")
     display_name = models.CharField(max_length=200, blank=True, default="")
     logo = ProcessedImageField(

@@ -4,7 +4,7 @@ import json
 import logging
 import operator
 import random
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Optional, Sequence
 from urllib.parse import urljoin
 
 from django.conf import settings
@@ -16,9 +16,8 @@ from cache_memoize import cache_memoize
 from cachetools import TTLCache, cachedmethod
 from eth_typing import ChecksumAddress
 from redis import Redis
-
-from gnosis.eth import EthereumClient, EthereumClientProvider
-from gnosis.eth.clients import EnsClient
+from safe_eth.eth import EthereumClient, EthereumNetwork, get_auto_ethereum_client
+from safe_eth.eth.clients import EnsClient
 
 from safe_transaction_service.tokens.constants import (
     CRYPTO_KITTIES_CONTRACT_ADDRESSES,
@@ -96,7 +95,7 @@ class CollectibleWithMetadata(Collectible):
     Collectible with metadata parsed if possible
     """
 
-    metadata: Dict[str, Any]
+    metadata: dict[str, Any]
     name: Optional[str] = dataclasses.field(init=False)
     description: Optional[str] = dataclasses.field(init=False)
     image_uri: Optional[str] = dataclasses.field(init=False)
@@ -138,7 +137,7 @@ class CollectibleWithMetadata(Collectible):
 class CollectiblesServiceProvider:
     def __new__(cls):
         if not hasattr(cls, "instance"):
-            cls.instance = CollectiblesService(EthereumClientProvider(), get_redis())
+            cls.instance = CollectiblesService(get_auto_ethereum_client(), get_redis())
 
         return cls.instance
 
@@ -161,17 +160,54 @@ class CollectiblesService:
         self.ethereum_client = ethereum_client
         self.ethereum_network = ethereum_client.get_network()
         self.redis = redis
-        self.ens_service: EnsClient = EnsClient(self.ethereum_network.value)
+
+        base_url = settings.ENS_SUBGRAPH_URL
+        api_key = settings.ENS_SUBGRAPH_API_KEY
+        subgraph_id = settings.ENS_SUBGRAPH_ID
+
+        # If the ENS subgraph is configured, always use it
+        if base_url and api_key and subgraph_id:
+            config = EnsClient.SubgraphConfig(
+                base_url=base_url,
+                api_key=api_key,
+                subgraph_id=subgraph_id,
+            )
+        # Else, provide fallback for Sepolia, Holesky or empty configuration.
+        else:
+            logger.warning(
+                "Using fallback EnsClient configuration. This configuration is not suitable for production and it is "
+                "recommended to setup a Subgraph API key. Mandatory for networks other than Sepolia or Holesky."
+                "See https://docs.ens.domains/web/subgraph"
+            )
+            config = self.fallback_ens_client()
+
+        self.ens_service: EnsClient = EnsClient(config=config)
 
         self.cache_token_info: TTLCache[ChecksumAddress, Erc721InfoWithLogo] = TTLCache(
             maxsize=4096, ttl=self.TOKEN_EXPIRATION
         )
         self.ens_image_url = settings.TOKENS_ENS_IMAGE_URL
 
+    def fallback_ens_client(self) -> EnsClient.Config:
+        if self.ethereum_network == EthereumNetwork.SEPOLIA:
+            return EnsClient.Config(
+                "https://api.studio.thegraph.com/query/49574/enssepolia/version/latest",
+            )
+        elif self.ethereum_network == EthereumNetwork.HOLESKY:
+            return EnsClient.Config(
+                "https://api.studio.thegraph.com/query/49574/ensholesky/version/latest",
+            )
+        else:
+            logger.warning(
+                "No fallback Ens Client configuration for network=%s available",
+                self.ethereum_network,
+            )
+            return EnsClient.Config("")
+
     def get_metadata_cache_key(self, address: str, token_id: int):
         return f"metadata:{address}:{token_id}"
 
-    def _decode_base64_uri(self, uri: str) -> Optional[Dict[str, Any]]:
+    def _decode_base64_uri(self, uri: str) -> Optional[dict[str, Any]]:
         """
         Decodes data:application/json;base64 uris
 
@@ -274,6 +310,9 @@ class CollectiblesService:
         Return metadata for a collectible
         :param collectible
         """
+        if not settings.COLLECTIBLES_ENABLE_DOWNLOAD_METADATA:
+            logger.warning("Downloading collectibles metadata is disabled")
+            return None
         if tld := ENS_CONTRACTS_WITH_TLD.get(
             collectible.address
         ):  # Special case for ENS
@@ -294,7 +333,7 @@ class CollectiblesService:
         exclude_spam: bool = False,
         limit: Optional[int] = None,
         offset: int = 0,
-    ) -> Tuple[List[Collectible], int]:
+    ) -> tuple[list[Collectible], int]:
         """
         :param safe_address:
         :param only_trusted: If True, return balance only for trusted tokens
@@ -337,7 +376,7 @@ class CollectiblesService:
         exclude_spam: bool = False,
         limit: Optional[int] = None,
         offset: int = 0,
-    ) -> Tuple[List[Collectible], int]:
+    ) -> tuple[list[Collectible], int]:
         """
         :param safe_address:
         :param only_trusted: If True, return balance only for trusted tokens
@@ -387,7 +426,7 @@ class CollectiblesService:
         exclude_spam: bool = False,
         limit: Optional[int] = None,
         offset: int = 0,
-    ) -> Tuple[List[CollectibleWithMetadata], int]:
+    ) -> tuple[list[CollectibleWithMetadata], int]:
         """
         Get collectibles using the owner, addresses and the token_ids
 
@@ -402,7 +441,7 @@ class CollectiblesService:
         # Async retry for getting metadata if fetching fails
         from ..tasks import retry_get_metadata_task
 
-        collectibles_with_metadata: List[CollectibleWithMetadata] = []
+        collectibles_with_metadata: list[CollectibleWithMetadata] = []
         collectibles, count = self.get_collectibles(
             safe_address,
             only_trusted=only_trusted,
@@ -502,7 +541,7 @@ class CollectiblesService:
         exclude_spam: bool = False,
         limit: int = 10,
         offset: int = 0,
-    ) -> Tuple[List[CollectibleWithMetadata], int]:
+    ) -> tuple[list[CollectibleWithMetadata], int]:
         """
         Get collectibles paginated
 
@@ -534,8 +573,8 @@ class CollectiblesService:
                 return Erc721InfoWithLogo.from_token(token)
 
     def get_token_uris(
-        self, addresses_with_token_ids: Sequence[Tuple[ChecksumAddress, int]]
-    ) -> List[Optional[str]]:
+        self, addresses_with_token_ids: Sequence[tuple[ChecksumAddress, int]]
+    ) -> list[Optional[str]]:
         """
         Cache token_uris, as they shouldn't change
 
@@ -543,7 +582,7 @@ class CollectiblesService:
         :return: List of token_uris in the same other that `addresses_with_token_ids` were provided
         """
 
-        def get_redis_key(address_with_token_id: Tuple[ChecksumAddress, int]) -> str:
+        def get_redis_key(address_with_token_id: tuple[ChecksumAddress, int]) -> str:
             token_address, token_id = address_with_token_id
             return f"token-uri:{token_address}:{token_id}"
 
@@ -553,8 +592,8 @@ class CollectiblesService:
             for address_with_token_id in addresses_with_token_ids
         )
         # Redis does not allow `None`, so empty string is used for uris searched but not found
-        found_uris: Dict[Tuple[ChecksumAddress, int], Optional[str]] = {}
-        not_found_uris: List[Tuple[ChecksumAddress, int]] = []
+        found_uris: dict[tuple[ChecksumAddress, int], Optional[str]] = {}
+        not_found_uris: list[tuple[ChecksumAddress, int]] = []
 
         for address_with_token_id, token_uri in zip(
             addresses_with_token_ids, redis_token_uris

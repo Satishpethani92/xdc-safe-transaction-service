@@ -1,14 +1,19 @@
 from dataclasses import dataclass
-from typing import Sequence, Tuple
+from typing import Sequence
 
 from django.conf import settings
 from django.core.management.base import BaseCommand
 from django.db.models import Min
 
 from django_celery_beat.models import CrontabSchedule, IntervalSchedule, PeriodicTask
-
-from gnosis.eth import EthereumClientProvider
-from gnosis.safe.addresses import MASTER_COPIES, PROXY_FACTORIES
+from safe_eth.eth import EthereumClient, get_auto_ethereum_client
+from safe_eth.safe.addresses import (
+    MASTER_COPIES,
+    PROXY_FACTORIES,
+    get_default_addresses_with_version,
+    safe_proxy_factory_contract_names,
+    safe_singleton_contract_names,
+)
 
 from ...models import IndexingStatus, IndexingStatusType, ProxyFactory, SafeMasterCopy
 
@@ -31,7 +36,7 @@ class CeleryTaskConfiguration:
     cron: CronDefinition = None
     enabled: bool = True
 
-    def create_task(self) -> Tuple[PeriodicTask, bool]:
+    def create_task(self) -> tuple[PeriodicTask, bool]:
         assert self.period or self.cron, "Task must define period or cron"
         if self.period:
             interval_schedule, _ = IntervalSchedule.objects.get_or_create(
@@ -136,6 +141,11 @@ TASKS = [
         cron=CronDefinition(minute=0, hour=0),  # Every day at 00:00 - 0 0 * * *
     ),
     CeleryTaskConfiguration(
+        name="safe_transaction_service.history.tasks.delete_expired_delegates_task",
+        description="Remove expired Safe Contract Delegates (every hour at minute 0)",
+        cron=CronDefinition(minute=0),  # Every hour at minute 0 - 0 * * * *
+    ),
+    CeleryTaskConfiguration(
         name="safe_transaction_service.contracts.tasks.create_missing_contracts_with_metadata_task",
         description="Index contract names and ABIs (every hour at minute 0)",
         cron=CronDefinition(minute=0),  # Every hour at minute 0 - 0 * * * *
@@ -190,14 +200,24 @@ class Command(BaseCommand):
                 )
 
         self.stdout.write(self.style.SUCCESS("Setting up Safe Contract Addresses"))
-        ethereum_client = EthereumClientProvider()
+        ethereum_client = get_auto_ethereum_client()
         ethereum_network = ethereum_client.get_network()
         if ethereum_network in MASTER_COPIES:
             self.stdout.write(
                 self.style.SUCCESS(f"Setting up {ethereum_network.name} safe addresses")
             )
-            self._setup_safe_master_copies(MASTER_COPIES[ethereum_network])
-            self._setup_erc20_indexing()
+            self._setup_safe_singleton_addresses(MASTER_COPIES[ethereum_network])
+
+        else:
+            self.stdout.write(
+                self.style.WARNING(
+                    f"Setting up {ethereum_network.name} default safe addresses from chain with unknown init block"
+                )
+            )
+            self._setup_safe_singleton_addresses_from_chain(ethereum_client)
+
+        self._setup_erc20_indexing()
+
         if ethereum_network in PROXY_FACTORIES:
             self.stdout.write(
                 self.style.SUCCESS(
@@ -205,19 +225,26 @@ class Command(BaseCommand):
                 )
             )
             self._setup_safe_proxy_factories(PROXY_FACTORIES[ethereum_network])
-
-        if not (
-            ethereum_network in MASTER_COPIES and ethereum_network in PROXY_FACTORIES
-        ):
+        else:
             self.stdout.write(
-                self.style.WARNING("Cannot detect a valid ethereum-network")
+                self.style.WARNING(
+                    f"Setting up {ethereum_network.name} default proxy factory addresses from chain with unknown init block"
+                )
+            )
+            self._setup_safe_proxy_factories_from_chain(ethereum_client)
+
+        if not (SafeMasterCopy.objects.count() and ProxyFactory.objects.count()):
+            self.stdout.write(
+                self.style.WARNING(
+                    f"Cannot find any SafeMasterCopy and ProxyFactory for chain id {ethereum_client.get_chain_id()}"
+                )
             )
 
-    def _setup_safe_master_copies(
-        self, safe_master_copies: Sequence[Tuple[str, int, str]]
+    def _setup_safe_singleton_addresses(
+        self, safe_singleton_addresses: Sequence[tuple[str, int, str]]
     ):
-        for address, initial_block_number, version in safe_master_copies:
-            safe_master_copy, _ = SafeMasterCopy.objects.get_or_create(
+        for address, initial_block_number, version in safe_singleton_addresses:
+            safe_singleton_address, _ = SafeMasterCopy.objects.get_or_create(
                 address=address,
                 defaults={
                     "initial_block_number": initial_block_number,
@@ -227,15 +254,17 @@ class Command(BaseCommand):
                 },
             )
             if (
-                safe_master_copy.version != version
-                or safe_master_copy.initial_block_number != initial_block_number
+                safe_singleton_address.version != version
+                or safe_singleton_address.initial_block_number != initial_block_number
             ):
-                safe_master_copy.version = initial_block_number
-                safe_master_copy.version = version
-                safe_master_copy.save(update_fields=["initial_block_number", "version"])
+                safe_singleton_address.initial_block_number = initial_block_number
+                safe_singleton_address.version = version
+                safe_singleton_address.save(
+                    update_fields=["initial_block_number", "version"]
+                )
 
     def _setup_safe_proxy_factories(
-        self, safe_proxy_factories: Sequence[Tuple[str, int]]
+        self, safe_proxy_factories: Sequence[tuple[str, int]]
     ):
         for address, initial_block_number in safe_proxy_factories:
             ProxyFactory.objects.get_or_create(
@@ -277,3 +306,34 @@ class Command(BaseCommand):
             indexing_status.save(update_fields=["block_number"])
             return True
         return False
+
+    @staticmethod
+    def _setup_safe_singleton_addresses_from_chain(ethereum_client: EthereumClient):
+        for address, version in get_default_addresses_with_version(
+            safe_singleton_contract_names
+        ):
+            if ethereum_client.is_contract(address):
+                safe_singleton_address, _ = SafeMasterCopy.objects.get_or_create(
+                    address=address,
+                    defaults={
+                        "initial_block_number": 0,
+                        "tx_block_number": 0,
+                        "version": version,
+                        "l2": version.endswith("+L2"),
+                    },
+                )
+
+    @staticmethod
+    def _setup_safe_proxy_factories_from_chain(ethereum_client: EthereumClient):
+        # Don't need the version
+        for address, _ in get_default_addresses_with_version(
+            safe_proxy_factory_contract_names
+        ):
+            if ethereum_client.is_contract(address):
+                ProxyFactory.objects.get_or_create(
+                    address=address,
+                    defaults={
+                        "initial_block_number": 0,
+                        "tx_block_number": 0,
+                    },
+                )

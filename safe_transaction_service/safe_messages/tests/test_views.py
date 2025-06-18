@@ -1,3 +1,4 @@
+import json
 import logging
 from unittest import mock
 from unittest.mock import MagicMock
@@ -11,11 +12,11 @@ from hexbytes import HexBytes
 from rest_framework import status
 from rest_framework.exceptions import ErrorDetail
 from rest_framework.test import APITestCase
-
-from gnosis.eth.eip712 import eip712_encode_hash
-from gnosis.safe.safe_signature import SafeSignatureEOA
-from gnosis.safe.signatures import signature_to_bytes
-from gnosis.safe.tests.safe_test_case import SafeTestCaseMixin
+from safe_eth.eth.eip712 import eip712_encode_hash
+from safe_eth.safe.safe_signature import SafeSignatureEOA
+from safe_eth.safe.signatures import signature_to_bytes
+from safe_eth.safe.tests.safe_test_case import SafeTestCaseMixin
+from safe_eth.util.util import to_0x_hex_str
 
 from safe_transaction_service.safe_messages.models import (
     SafeMessage,
@@ -59,6 +60,7 @@ class TestMessageViews(SafeTestCaseMixin, APITestCase):
                 "message": safe_message.message,
                 "proposedBy": safe_message.proposed_by,
                 "safeAppId": safe_message.safe_app_id,
+                "origin": json.dumps(safe_message.origin),
                 "preparedSignature": None,
                 "confirmations": [],
             },
@@ -82,13 +84,14 @@ class TestMessageViews(SafeTestCaseMixin, APITestCase):
                 "message": safe_message.message,
                 "proposedBy": safe_message.proposed_by,
                 "safeAppId": safe_message.safe_app_id,
-                "preparedSignature": safe_message_confirmation.signature.hex(),
+                "origin": json.dumps(safe_message.origin),
+                "preparedSignature": to_0x_hex_str(safe_message_confirmation.signature),
                 "confirmations": [
                     {
                         "created": datetime_to_str(safe_message_confirmation.created),
                         "modified": datetime_to_str(safe_message_confirmation.modified),
                         "owner": safe_message_confirmation.owner,
-                        "signature": safe_message_confirmation.signature.hex(),
+                        "signature": to_0x_hex_str(safe_message_confirmation.signature),
                         "signatureType": "EOA",
                     }
                 ],
@@ -118,13 +121,14 @@ class TestMessageViews(SafeTestCaseMixin, APITestCase):
                 "message": safe_message.message,
                 "proposedBy": safe_message.proposed_by,
                 "safeAppId": safe_message.safe_app_id,
-                "preparedSignature": safe_message_confirmation.signature.hex(),
+                "origin": json.dumps(safe_message.origin),
+                "preparedSignature": to_0x_hex_str(safe_message_confirmation.signature),
                 "confirmations": [
                     {
                         "created": datetime_to_str(safe_message_confirmation.created),
                         "modified": datetime_to_str(safe_message_confirmation.modified),
                         "owner": safe_message_confirmation.owner,
-                        "signature": safe_message_confirmation.signature.hex(),
+                        "signature": to_0x_hex_str(safe_message_confirmation.signature),
                         "signatureType": "EOA",
                     }
                 ],
@@ -148,7 +152,7 @@ class TestMessageViews(SafeTestCaseMixin, APITestCase):
             safe.get_message_hash(message_hash) for message_hash in message_hashes
         ]
         signatures = [
-            account.signHash(safe_message_hash)["signature"].hex()
+            to_0x_hex_str(account.unsafe_sign_hash(safe_message_hash)["signature"])
             for safe_message_hash in safe_message_hashes
         ]
 
@@ -232,6 +236,23 @@ class TestMessageViews(SafeTestCaseMixin, APITestCase):
                     )
 
                 get_owners_mock.return_value = [account.address]
+
+                with self.settings(BANNED_EOAS={account.address}):
+                    response = self.client.post(
+                        reverse("v1:safe_messages:safe-messages", args=(safe_address,)),
+                        format="json",
+                        data=data,
+                    )
+                    self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                    self.assertEqual(
+                        response.json(),
+                        {
+                            "nonFieldErrors": [
+                                f"Signer={account.address} is not authorized to interact with the service"
+                            ]
+                        },
+                    )
+
                 response = self.client.post(
                     reverse("v1:safe_messages:safe-messages", args=(safe_address,)),
                     format="json",
@@ -252,24 +273,27 @@ class TestMessageViews(SafeTestCaseMixin, APITestCase):
                     {
                         "non_field_errors": [
                             ErrorDetail(
-                                string=f"Message with hash {safe_message_hash.hex()} for safe {safe_address} already exists in DB",
+                                string=f"Message with hash {to_0x_hex_str(safe_message_hash)} for safe {safe_address} "
+                                f"already exists in DB",
                                 code="invalid",
                             )
                         ]
                     },
                 )
 
-    def test_safe_messages_create_using_1271_signature_view(self):
+    def _test_safe_messages_create_using_1271_signature_view(self, safe_deployment_fn):
         account = Account.create()
-        safe_owner = self.deploy_test_safe(owners=[account.address])
-        safe = self.deploy_test_safe(owners=[safe_owner.address])
+        safe_owner = safe_deployment_fn(owners=[account.address])
+        safe = safe_deployment_fn(owners=[safe_owner.address])
 
         safe_address = safe.address
         message = get_eip712_payload_mock()
         description = "Testing EIP712 message signing"
         message_hash = eip712_encode_hash(message)
         safe_owner_message_hash = safe_owner.get_message_hash(message_hash)
-        safe_owner_signature = account.signHash(safe_owner_message_hash)["signature"]
+        safe_owner_signature = account.unsafe_sign_hash(safe_owner_message_hash)[
+            "signature"
+        ]
 
         # Build EIP1271 signature v=0 r=safe v=dynamic_part dynamic_part=size+owner_signature
         signature_1271 = (
@@ -282,7 +306,7 @@ class TestMessageViews(SafeTestCaseMixin, APITestCase):
         data = {
             "message": message,
             "description": description,
-            "signature": HexBytes(signature_1271).hex(),
+            "signature": to_0x_hex_str(HexBytes(signature_1271)),
         }
         response = self.client.post(
             reverse("v1:safe_messages:safe-messages", args=(safe_address,)),
@@ -292,6 +316,16 @@ class TestMessageViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(SafeMessage.objects.count(), 1)
         self.assertEqual(SafeMessageConfirmation.objects.count(), 1)
+
+    def test_safe_messages_create_using_1271_signature_v1_3_0_view(self):
+        return self._test_safe_messages_create_using_1271_signature_view(
+            self.deploy_test_safe_v1_3_0
+        )
+
+    def test_safe_messages_create_using_1271_signature_v1_4_1_view(self):
+        return self._test_safe_messages_create_using_1271_signature_view(
+            self.deploy_test_safe_v1_4_1
+        )
 
     @mock.patch(
         "safe_transaction_service.safe_messages.serializers.get_safe_owners",
@@ -334,7 +368,7 @@ class TestMessageViews(SafeTestCaseMixin, APITestCase):
         )
 
         # Test same signature
-        data["signature"] = safe_message_confirmation.signature.hex()
+        data["signature"] = to_0x_hex_str(safe_message_confirmation.signature)
         response = self.client.post(
             reverse("v1:safe_messages:signatures", args=(safe_message.message_hash,)),
             format="json",
@@ -355,9 +389,9 @@ class TestMessageViews(SafeTestCaseMixin, APITestCase):
 
         # Test not existing owner
         owner_account = Account.create()
-        data["signature"] = owner_account.signHash(safe_message.message_hash)[
-            "signature"
-        ].hex()
+        data["signature"] = to_0x_hex_str(
+            owner_account.unsafe_sign_hash(safe_message.message_hash)["signature"]
+        )
         response = self.client.post(
             reverse("v1:safe_messages:signatures", args=(safe_message.message_hash,)),
             format="json",
@@ -435,6 +469,7 @@ class TestMessageViews(SafeTestCaseMixin, APITestCase):
                         "message": safe_message.message,
                         "proposedBy": safe_message.proposed_by,
                         "safeAppId": safe_message.safe_app_id,
+                        "origin": json.dumps(safe_message.origin),
                         "preparedSignature": None,
                         "confirmations": [],
                     }
@@ -465,7 +500,10 @@ class TestMessageViews(SafeTestCaseMixin, APITestCase):
                         "message": safe_message.message,
                         "proposedBy": safe_message.proposed_by,
                         "safeAppId": safe_message.safe_app_id,
-                        "preparedSignature": safe_message_confirmation.signature.hex(),
+                        "origin": json.dumps(safe_message.origin),
+                        "preparedSignature": to_0x_hex_str(
+                            safe_message_confirmation.signature
+                        ),
                         "confirmations": [
                             {
                                 "created": datetime_to_str(
@@ -475,7 +513,9 @@ class TestMessageViews(SafeTestCaseMixin, APITestCase):
                                     safe_message_confirmation.modified
                                 ),
                                 "owner": safe_message_confirmation.owner,
-                                "signature": safe_message_confirmation.signature.hex(),
+                                "signature": to_0x_hex_str(
+                                    safe_message_confirmation.signature
+                                ),
                                 "signatureType": "EOA",
                             }
                         ],
@@ -512,7 +552,10 @@ class TestMessageViews(SafeTestCaseMixin, APITestCase):
                         "message": safe_message.message,
                         "proposedBy": safe_message.proposed_by,
                         "safeAppId": safe_message.safe_app_id,
-                        "preparedSignature": safe_message_confirmation.signature.hex(),
+                        "origin": json.dumps(safe_message.origin),
+                        "preparedSignature": to_0x_hex_str(
+                            safe_message_confirmation.signature
+                        ),
                         "confirmations": [
                             {
                                 "created": datetime_to_str(
@@ -522,7 +565,9 @@ class TestMessageViews(SafeTestCaseMixin, APITestCase):
                                     safe_message_confirmation.modified
                                 ),
                                 "owner": safe_message_confirmation.owner,
-                                "signature": safe_message_confirmation.signature.hex(),
+                                "signature": to_0x_hex_str(
+                                    safe_message_confirmation.signature
+                                ),
                                 "signatureType": "EOA",
                             }
                         ],
@@ -557,6 +602,7 @@ class TestMessageViews(SafeTestCaseMixin, APITestCase):
                 "message": safe_message.message,
                 "proposedBy": safe_message.proposed_by,
                 "safeAppId": safe_message.safe_app_id,
+                "origin": json.dumps(safe_message.origin),
                 "preparedSignature": None,
                 "confirmations": [],
             },
@@ -580,13 +626,14 @@ class TestMessageViews(SafeTestCaseMixin, APITestCase):
                 "message": safe_message.message,
                 "proposedBy": safe_message.proposed_by,
                 "safeAppId": safe_message.safe_app_id,
-                "preparedSignature": safe_message_confirmation.signature.hex(),
+                "origin": json.dumps(safe_message.origin),
+                "preparedSignature": to_0x_hex_str(safe_message_confirmation.signature),
                 "confirmations": [
                     {
                         "created": datetime_to_str(safe_message_confirmation.created),
                         "modified": datetime_to_str(safe_message_confirmation.modified),
                         "owner": safe_message_confirmation.owner,
-                        "signature": safe_message_confirmation.signature.hex(),
+                        "signature": to_0x_hex_str(safe_message_confirmation.signature),
                         "signatureType": "EOA",
                     }
                 ],

@@ -1,27 +1,27 @@
 import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
+import safe_eth.eth.django.serializers as eth_serializers
 from eth_typing import ChecksumAddress, HexStr
 from hexbytes import HexBytes
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
-
-import gnosis.eth.django.serializers as eth_serializers
-from gnosis.eth import EthereumClientProvider
-from gnosis.eth.account_abstraction import UserOperation as UserOperationClass
-from gnosis.eth.utils import fast_keccak, fast_to_checksum_address
-from gnosis.safe.account_abstraction import SafeOperation as SafeOperationClass
-from gnosis.safe.safe_signature import SafeSignature, SafeSignatureType
+from safe_eth.eth import get_auto_ethereum_client
+from safe_eth.eth.account_abstraction import UserOperation as UserOperationClass
+from safe_eth.eth.utils import fast_keccak, fast_to_checksum_address
+from safe_eth.safe.account_abstraction import SafeOperation as SafeOperationClass
+from safe_eth.safe.safe_signature import SafeSignature, SafeSignatureType
+from safe_eth.util.util import to_0x_hex_str
 
 from safe_transaction_service.utils.constants import SIGNATURE_LENGTH
 from safe_transaction_service.utils.ethereum import get_chain_id
 
 from ..utils.serializers import get_safe_owners
-from .models import SafeOperation
+from .helpers import decode_init_code
 from .models import SafeOperation as SafeOperationModel
 from .models import SafeOperationConfirmation
 from .models import UserOperation as UserOperationModel
@@ -30,11 +30,70 @@ from .models import UserOperation as UserOperationModel
 # ================================================ #
 #            Request Serializers
 # ================================================ #
-class SafeOperationSerializer(serializers.Serializer):
+class SafeOperationSignatureValidatorMixin:
+    """
+    Mixin class to validate SafeOperation signatures. `_get_owners` can be overridden to define
+    the valid owners to sign
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ethereum_client = get_auto_ethereum_client()
+        self._deployment_owners: list[ChecksumAddress] = []
+
+    def _get_owners(self, safe_address: ChecksumAddress) -> list[ChecksumAddress]:
+        """
+        :param safe_address:
+        :return:  `init_code` decoded owners if Safe is not deployed or current blockchain owners if Safe is deployed
+        """
+        try:
+            return get_safe_owners(safe_address)
+        except ValidationError as exc:
+            if self._deployment_owners:
+                return self._deployment_owners
+            raise exc
+
+    def _validate_signature(
+        self,
+        safe_address: ChecksumAddress,
+        safe_operation_hash: bytes,
+        safe_operation_hash_preimage: bytes,
+        signature: bytes,
+    ) -> list[SafeSignature]:
+        safe_owners = self._get_owners(safe_address)
+        parsed_signatures = SafeSignature.parse_signature(
+            signature,
+            safe_operation_hash,
+            safe_hash_preimage=safe_operation_hash_preimage,
+        )
+        owners_processed = set()
+        safe_signatures = []
+        for safe_signature in parsed_signatures:
+            owner = safe_signature.owner
+            if owner not in safe_owners:
+                raise ValidationError(
+                    f"Signer={owner} is not an owner. Current owners={safe_owners}. "
+                    f"Safe-operation-hash={to_0x_hex_str(safe_operation_hash)}"
+                )
+            if not safe_signature.is_valid(self.ethereum_client, safe_address):
+                raise ValidationError(
+                    f"Signature={to_0x_hex_str(safe_signature.signature)} for owner={owner} is not valid"
+                )
+            if owner in owners_processed:
+                raise ValidationError(f"Signature for owner={owner} is duplicated")
+
+            owners_processed.add(owner)
+            safe_signatures.append(safe_signature)
+        return safe_signatures
+
+
+class SafeOperationSerializer(
+    SafeOperationSignatureValidatorMixin, serializers.Serializer
+):
     nonce = serializers.IntegerField(min_value=0)
     init_code = eth_serializers.HexadecimalField(allow_null=True)
     call_data = eth_serializers.HexadecimalField(allow_null=True)
-    call_data_gas_limit = serializers.IntegerField(min_value=0)
+    call_gas_limit = serializers.IntegerField(min_value=0)
     verification_gas_limit = serializers.IntegerField(min_value=0)
     pre_verification_gas = serializers.IntegerField(min_value=0)
     max_fee_per_gas = serializers.IntegerField(min_value=0)
@@ -49,41 +108,6 @@ class SafeOperationSerializer(serializers.Serializer):
     valid_until = serializers.DateTimeField(allow_null=True)  # Epoch uint48
     module_address = eth_serializers.EthereumAddressField()
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.ethereum_client = EthereumClientProvider()
-
-    def _validate_signature(
-        self,
-        safe_address: ChecksumAddress,
-        safe_operation_hash: bytes,
-        safe_operation_hash_preimage: bytes,
-        signature: bytes,
-    ) -> List[SafeSignature]:
-        safe_owners = get_safe_owners(safe_address)
-        parsed_signatures = SafeSignature.parse_signature(
-            signature, safe_operation_hash, safe_operation_hash_preimage
-        )
-        owners_processed = set()
-        safe_signatures = []
-        for safe_signature in parsed_signatures:
-            owner = safe_signature.owner
-            if owner not in safe_owners:
-                raise ValidationError(
-                    f"Signer={owner} is not an owner. Current owners={safe_owners}. "
-                    f"Safe-operation-hash={safe_operation_hash.hex()}"
-                )
-            if not safe_signature.is_valid(self.ethereum_client, safe_address):
-                raise ValidationError(
-                    f"Signature={safe_signature.signature.hex()} for owner={owner} is not valid"
-                )
-            if owner in owners_processed:
-                raise ValidationError(f"Signature for owner={owner} is duplicated")
-
-            owners_processed.add(owner)
-            safe_signatures.append(safe_signature)
-        return safe_signatures
-
     def validate_init_code(self, init_code: Optional[HexBytes]) -> Optional[HexBytes]:
         """
         Check `init_code` is not provided for already initialized contracts
@@ -91,12 +115,35 @@ class SafeOperationSerializer(serializers.Serializer):
         :param init_code:
         :return: `init_code`
         """
+        safe_address = self.context["safe_address"]
+        safe_is_deployed = self.ethereum_client.is_contract(safe_address)
         if init_code:
-            safe_address = self.context["safe_address"]
-            if self.ethereum_client.is_contract(safe_address):
+            if safe_is_deployed:
                 raise ValidationError(
                     "`init_code` must be empty as the contract was already initialized"
                 )
+
+            try:
+                decoded_init_code = decode_init_code(init_code, self.ethereum_client)
+            except ValueError:
+                raise ValidationError("Cannot decode data")
+            if not self.ethereum_client.is_contract(decoded_init_code.factory_address):
+                raise ValidationError(
+                    f"`init_code` factory-address={decoded_init_code.factory_address} is not initialized"
+                )
+
+            if decoded_init_code.expected_address != safe_address:
+                raise ValidationError(
+                    f"Provided safe-address={safe_address} does not match "
+                    f"calculated-safe-address={decoded_init_code.expected_address}"
+                )
+            # Store owners used for deployment, to do checks afterward
+            self._deployment_owners = decoded_init_code.owners
+        elif not safe_is_deployed:
+            raise ValidationError(
+                "`init_code` was not provided and contract was not initialized"
+            )
+
         return init_code
 
     def validate_module_address(
@@ -173,7 +220,7 @@ class SafeOperationSerializer(serializers.Serializer):
             attrs["nonce"],
             fast_keccak(attrs["init_code"] or b""),
             fast_keccak(attrs["call_data"] or b""),
-            attrs["call_data_gas_limit"],
+            attrs["call_gas_limit"],
             attrs["verification_gas_limit"],
             attrs["pre_verification_gas"],
             attrs["max_fee_per_gas"],
@@ -195,7 +242,7 @@ class SafeOperationSerializer(serializers.Serializer):
 
         if SafeOperationModel.objects.filter(hash=safe_operation_hash).exists():
             raise ValidationError(
-                f"SafeOperation with hash={safe_operation_hash.hex()} already exists"
+                f"SafeOperation with hash={to_0x_hex_str(safe_operation_hash)} already exists"
             )
 
         safe_signatures = self._validate_signature(
@@ -214,12 +261,12 @@ class SafeOperationSerializer(serializers.Serializer):
     @transaction.atomic
     def save(self, **kwargs):
         user_operation = UserOperationClass(
-            b"",
+            b"",  # Hash will be calculated later
             self.context["safe_address"],
             self.validated_data["nonce"],
             self.validated_data["init_code"] or b"",
             self.validated_data["call_data"] or b"",
-            self.validated_data["call_data_gas_limit"],
+            self.validated_data["call_gas_limit"],
             self.validated_data["verification_gas_limit"],
             self.validated_data["pre_verification_gas"],
             self.validated_data["max_fee_per_gas"],
@@ -233,7 +280,7 @@ class SafeOperationSerializer(serializers.Serializer):
             self.validated_data["chain_id"]
         )
 
-        user_operation_model, created = UserOperationModel.objects.get_or_create(
+        user_operation_model, _ = UserOperationModel.objects.get_or_create(
             hash=user_operation_hash,
             defaults={
                 "ethereum_tx": None,
@@ -241,7 +288,7 @@ class SafeOperationSerializer(serializers.Serializer):
                 "nonce": user_operation.nonce,
                 "init_code": user_operation.init_code,
                 "call_data": user_operation.call_data,
-                "call_data_gas_limit": user_operation.call_gas_limit,
+                "call_gas_limit": user_operation.call_gas_limit,
                 "verification_gas_limit": user_operation.verification_gas_limit,
                 "pre_verification_gas": user_operation.pre_verification_gas,
                 "max_fee_per_gas": user_operation.max_fee_per_gas,
@@ -253,14 +300,15 @@ class SafeOperationSerializer(serializers.Serializer):
             },
         )
 
-        if created:
-            safe_operation_model = SafeOperationModel.objects.create(
-                hash=self.validated_data["safe_operation_hash"],
-                user_operation=user_operation_model,
-                valid_after=self.validated_data["valid_after"],
-                valid_until=self.validated_data["valid_until"],
-                module_address=self.validated_data["module_address"],
-            )
+        safe_operation_model, _ = SafeOperationModel.objects.get_or_create(
+            hash=self.validated_data["safe_operation_hash"],
+            defaults={
+                "user_operation": user_operation_model,
+                "valid_after": self.validated_data["valid_after"],
+                "valid_until": self.validated_data["valid_until"],
+                "module_address": self.validated_data["module_address"],
+            },
+        )
 
         safe_signatures = self.validated_data["safe_signatures"]
         for safe_signature in safe_signatures:
@@ -274,6 +322,75 @@ class SafeOperationSerializer(serializers.Serializer):
             )
 
         return user_operation_model
+
+
+class SafeOperationConfirmationSerializer(
+    SafeOperationSignatureValidatorMixin, serializers.Serializer
+):
+    """
+    Validate new confirmations for an existing `SafeOperation`
+    """
+
+    signature = eth_serializers.HexadecimalField(
+        min_length=65, max_length=SIGNATURE_LENGTH
+    )
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        safe_operation_hash_hex = self.context["safe_operation_hash"]
+        safe_operation_hash = HexBytes(safe_operation_hash_hex)
+
+        try:
+            user_operation_model: UserOperationModel = (
+                UserOperationModel.objects.select_related("safe_operation").get(
+                    safe_operation__hash=safe_operation_hash_hex
+                )
+            )
+            safe_operation = user_operation_model.to_safe_operation()
+        except UserOperationModel.DoesNotExist:
+            raise ValidationError(
+                f"SafeOperation with hash={safe_operation_hash_hex} does not exist"
+            )
+
+        # Parse valid owners from init code
+        if user_operation_model.init_code:
+            decoded_init_code = decode_init_code(
+                bytes(user_operation_model.init_code), self.ethereum_client
+            )
+            self._deployment_owners = decoded_init_code.owners
+
+        safe_signatures = self._validate_signature(
+            safe_operation.safe,
+            safe_operation_hash,
+            safe_operation.safe_operation_hash_preimage,
+            attrs["signature"],
+        )
+        if not safe_signatures:
+            raise ValidationError("At least one signature must be provided")
+
+        attrs["safe_operation_hash"] = safe_operation_hash_hex
+        attrs["safe_signatures"] = safe_signatures
+        return attrs
+
+    @transaction.atomic
+    def save(self, **kwargs):
+        safe_signatures = self.validated_data["safe_signatures"]
+        safe_operation_confirmations: list[SafeOperationConfirmation] = []
+        for safe_signature in safe_signatures:
+            safe_operation_confirmation, created = (
+                SafeOperationConfirmation.objects.get_or_create(
+                    safe_operation_id=self.context["safe_operation_hash"],
+                    owner=safe_signature.owner,
+                    defaults={
+                        "signature": safe_signature.export_signature(),
+                        "signature_type": safe_signature.signature_type.value,
+                    },
+                )
+            )
+            if created:
+                safe_operation_confirmations.append(safe_operation_confirmation)
+
+        return safe_operation_confirmations
 
 
 # ================================================ #
@@ -290,51 +407,30 @@ class SafeOperationConfirmationResponseSerializer(serializers.Serializer):
         return SafeSignatureType(obj.signature_type).name
 
 
+class UserOperationResponseSerializer(serializers.Serializer):
+    ethereum_tx_hash = eth_serializers.HexadecimalField(source="ethereum_tx_id")
+
+    sender = eth_serializers.EthereumAddressField()
+    user_operation_hash = eth_serializers.HexadecimalField(source="hash")
+    nonce = serializers.CharField()
+    init_code = eth_serializers.HexadecimalField(allow_null=True)
+    call_data = eth_serializers.HexadecimalField(allow_null=True)
+    call_gas_limit = serializers.CharField()
+    verification_gas_limit = serializers.CharField()
+    pre_verification_gas = serializers.CharField()
+    max_fee_per_gas = serializers.CharField()
+    max_priority_fee_per_gas = serializers.CharField()
+    paymaster = eth_serializers.EthereumAddressField(allow_null=True)
+    paymaster_data = eth_serializers.HexadecimalField(allow_null=True)
+    signature = eth_serializers.HexadecimalField()
+    entry_point = eth_serializers.EthereumAddressField()
+
+
 class SafeOperationResponseSerializer(serializers.Serializer):
     created = serializers.DateTimeField()
     modified = serializers.DateTimeField()
-    ethereum_tx_hash = eth_serializers.HexadecimalField(
-        source="user_operation.ethereum_tx_id"
-    )
-
-    # User Operation fields
-    sender = eth_serializers.EthereumAddressField(source="user_operation.sender")
-    user_operation_hash = eth_serializers.HexadecimalField(source="user_operation.hash")
     safe_operation_hash = eth_serializers.HexadecimalField(source="hash")
-    nonce = serializers.IntegerField(min_value=0, source="user_operation.nonce")
-    init_code = eth_serializers.HexadecimalField(
-        allow_null=True, source="user_operation.init_code"
-    )
-    call_data = eth_serializers.HexadecimalField(
-        allow_null=True, source="user_operation.call_data"
-    )
-    call_data_gas_limit = serializers.IntegerField(
-        min_value=0, source="user_operation.call_data_gas_limit"
-    )
-    verification_gas_limit = serializers.IntegerField(
-        min_value=0, source="user_operation.verification_gas_limit"
-    )
-    pre_verification_gas = serializers.IntegerField(
-        min_value=0, source="user_operation.pre_verification_gas"
-    )
-    max_fee_per_gas = serializers.IntegerField(
-        min_value=0, source="user_operation.max_fee_per_gas"
-    )
-    max_priority_fee_per_gas = serializers.IntegerField(
-        min_value=0, source="user_operation.max_priority_fee_per_gas"
-    )
-    paymaster = eth_serializers.EthereumAddressField(
-        allow_null=True, source="user_operation.paymaster"
-    )
-    paymaster_data = eth_serializers.HexadecimalField(
-        allow_null=True, source="user_operation.paymaster_data"
-    )
-    signature = eth_serializers.HexadecimalField(source="user_operation.signature")
-    entry_point = eth_serializers.EthereumAddressField(
-        source="user_operation.entry_point"
-    )
 
-    # Safe Operation fields
     valid_after = serializers.DateTimeField()
     valid_until = serializers.DateTimeField()
     module_address = eth_serializers.EthereumAddressField()
@@ -342,7 +438,7 @@ class SafeOperationResponseSerializer(serializers.Serializer):
     confirmations = serializers.SerializerMethodField()
     prepared_signature = serializers.SerializerMethodField()
 
-    def get_confirmations(self, obj: SafeOperation) -> Dict[str, Any]:
+    def get_confirmations(self, obj: SafeOperationModel) -> dict[str, Any]:
         """
         Filters confirmations queryset
 
@@ -353,12 +449,22 @@ class SafeOperationResponseSerializer(serializers.Serializer):
             obj.confirmations, many=True
         ).data
 
-    def get_prepared_signature(self, obj: SafeOperation) -> Optional[HexStr]:
+    def get_prepared_signature(self, obj: SafeOperationModel) -> HexStr:
         """
         Prepared signature sorted
 
         :param obj: SafeOperation instance
         :return: Serialized queryset
         """
-        signature = HexBytes(obj.build_signature())
-        return signature.hex() if signature else None
+        signature = obj.build_signature()
+        return to_0x_hex_str(HexBytes(signature))
+
+
+class SafeOperationWithUserOperationResponseSerializer(SafeOperationResponseSerializer):
+    user_operation = UserOperationResponseSerializer(many=False, read_only=True)
+
+
+class UserOperationWithSafeOperationResponseSerializer(UserOperationResponseSerializer):
+    safe_operation = SafeOperationResponseSerializer(
+        many=False, read_only=True, allow_null=True
+    )

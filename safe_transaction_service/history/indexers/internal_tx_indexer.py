@@ -1,15 +1,15 @@
 from collections import OrderedDict
 from logging import getLogger
-from typing import Dict, Generator, Iterable, List, Optional, Sequence, Set
+from typing import Generator, Iterable, Optional, Sequence, Set
 
 from django.conf import settings
 from django.db import transaction
 
-from eth_typing import HexStr
+from eth_typing import ChecksumAddress, HexStr
 from hexbytes import HexBytes
+from safe_eth.eth import EthereumClient
+from safe_eth.util.util import to_0x_hex_str
 from web3.types import BlockTrace, FilterTrace
-
-from gnosis.eth import EthereumClient
 
 from safe_transaction_service.contracts.tx_decoder import (
     CannotDecode,
@@ -18,7 +18,12 @@ from safe_transaction_service.contracts.tx_decoder import (
 )
 from safe_transaction_service.utils.utils import chunks
 
-from ..models import InternalTx, InternalTxDecoded, MonitoredAddress, SafeMasterCopy
+from ..models import (
+    InternalTx,
+    InternalTxDecoded,
+    SafeMasterCopy,
+    SafeRelevantTransaction,
+)
 from .element_already_processed_checker import ElementAlreadyProcessedChecker
 from .ethereum_indexer import EthereumIndexer, FindRelevantElementsException
 
@@ -76,11 +81,11 @@ class InternalTxIndexer(EthereumIndexer):
 
     def find_relevant_elements(
         self,
-        addresses: Sequence[str],
+        addresses: set[ChecksumAddress],
         from_block_number: int,
         to_block_number: int,
         current_block_number: Optional[int] = None,
-    ) -> OrderedDict[HexBytes, Optional[FilterTrace]]:
+    ) -> OrderedDict[bytes, None | list[BlockTrace]]:
         current_block_number = (
             current_block_number or self.ethereum_client.current_block_number
         )
@@ -113,8 +118,11 @@ class InternalTxIndexer(EthereumIndexer):
             return relevant_elements
 
     def _find_relevant_elements_using_trace_block(
-        self, addresses: Sequence[str], from_block_number: int, to_block_number: int
-    ) -> OrderedDict[HexBytes, FilterTrace]:
+        self,
+        addresses: set[ChecksumAddress],
+        from_block_number: int,
+        to_block_number: int,
+    ) -> OrderedDict[bytes, list[BlockTrace]]:
         addresses_set = set(addresses)  # More optimal to use with `in`
         logger.debug(
             "Using trace_block from-block=%d to-block=%d",
@@ -125,17 +133,17 @@ class InternalTxIndexer(EthereumIndexer):
             block_numbers = list(range(from_block_number, to_block_number + 1))
 
             with self.auto_adjust_block_limit(from_block_number, to_block_number):
-                blocks_traces: BlockTrace = self.ethereum_client.tracing.trace_blocks(
+                all_blocks_traces = self.ethereum_client.tracing.trace_blocks(
                     block_numbers
                 )
-            traces: OrderedDict[HexStr, FilterTrace] = OrderedDict()
-            relevant_tx_hashes: Set[HexStr] = set()
-            for block_number, block_traces in zip(block_numbers, blocks_traces):
+            traces: OrderedDict[bytes, list[BlockTrace]] = OrderedDict()
+            relevant_tx_hashes: Set[bytes] = set()
+            for block_number, block_traces in zip(block_numbers, all_blocks_traces):
                 if not block_traces:
                     logger.warning("Empty `trace_block` for block=%d", block_number)
 
                 for trace in block_traces:
-                    transaction_hash = trace.get("transactionHash")
+                    transaction_hash: bytes = trace.get("transactionHash")
                     if transaction_hash:
                         traces.setdefault(transaction_hash, []).append(trace)
                         # We're only interested in traces related to the provided addresses
@@ -157,8 +165,11 @@ class InternalTxIndexer(EthereumIndexer):
             ) from e
 
     def _find_relevant_elements_using_trace_filter(
-        self, addresses: Sequence[str], from_block_number: int, to_block_number: int
-    ) -> OrderedDict[HexStr, List]:
+        self,
+        addresses: set[ChecksumAddress],
+        from_block_number: int,
+        to_block_number: int,
+    ) -> OrderedDict[bytes, None]:
         """
         Search for tx hashes with internal txs (in and out) of a `address`
 
@@ -179,7 +190,7 @@ class InternalTxIndexer(EthereumIndexer):
                 to_traces = self.ethereum_client.tracing.trace_filter(
                     from_block=from_block_number,
                     to_block=to_block_number,
-                    to_address=addresses,
+                    to_address=list(addresses),
                 )
         except IOError as e:
             raise FindRelevantElementsException(
@@ -201,12 +212,12 @@ class InternalTxIndexer(EthereumIndexer):
             ) from e
 
         # Log INFO if traces found, DEBUG if not
-        traces: OrderedDict[HexBytes, None] = OrderedDict()
+        traces: OrderedDict[bytes, None] = OrderedDict()
         for trace in to_traces:
             transaction_hash = trace.get("transactionHash")
             if transaction_hash:
                 # Leave this empty, as we are missing traces for the transaction and will need to be fetched later
-                traces[transaction_hash] = []
+                traces[transaction_hash] = None
 
         log_fn = logger.info if traces else logger.debug
         log_fn(
@@ -232,8 +243,8 @@ class InternalTxIndexer(EthereumIndexer):
             .filter(ethereum_tx__in=tx_hashes)
             .iterator()
         ):
+            data = bytes(internal_tx.data)
             try:
-                data = bytes(internal_tx.data)
                 function_name, arguments = self.tx_decoder.decode_transaction(data)
                 yield InternalTxDecoded(
                     internal_tx=internal_tx,
@@ -242,13 +253,15 @@ class InternalTxIndexer(EthereumIndexer):
                     processed=False,
                 )
             except CannotDecode as exc:
-                logger.debug("Cannot decode %s: %s", data.hex(), exc)
+                logger.debug("Cannot decode %s: %s", to_0x_hex_str(data), exc)
             except UnexpectedProblemDecoding as exc:
-                logger.warning("Unexpected problem decoding %s: %s", data.hex(), exc)
+                logger.warning(
+                    "Unexpected problem decoding %s: %s", to_0x_hex_str(data), exc
+                )
 
     def trace_transactions(
         self, tx_hashes: Sequence[HexStr], batch_size: int
-    ) -> Iterable[List[FilterTrace]]:
+    ) -> Iterable[list[FilterTrace]]:
         batch_size = batch_size or len(tx_hashes)  # If `0`, don't use batches
         for tx_hash_chunk in chunks(list(tx_hashes), batch_size):
             tx_hash_chunk = list(tx_hash_chunk)
@@ -265,9 +278,24 @@ class InternalTxIndexer(EthereumIndexer):
                 )
                 raise
 
+    def filter_relevant_txs(
+        self, internal_txs: Generator[InternalTx, None, None]
+    ) -> Generator[InternalTx, None, None]:
+        for internal_tx in internal_txs:
+            if internal_tx.is_relevant:
+                if internal_tx.is_ether_transfer:
+                    SafeRelevantTransaction.objects.get_or_create(
+                        ethereum_tx_id=internal_tx.ethereum_tx_id,
+                        safe=internal_tx.to,
+                        defaults={
+                            "timestamp": internal_tx.timestamp,
+                        },
+                    )
+                yield internal_tx
+
     def process_elements(
-        self, tx_hash_with_traces: OrderedDict[HexBytes, Optional[FilterTrace]]
-    ) -> List[HexBytes]:
+        self, tx_hash_with_traces: OrderedDict[bytes, Optional[FilterTrace]]
+    ) -> list[HexBytes]:
         """
         :param tx_hash_with_traces:
         :return: Inserted `InternalTx` objects
@@ -328,13 +356,10 @@ class InternalTxIndexer(EthereumIndexer):
 
         with transaction.atomic():
             logger.debug("Storing traces")
-            revelant_internal_txs_batch = (
-                trace for trace in internal_txs if trace.is_relevant
-            )
             traces_stored = InternalTx.objects.bulk_create_from_generator(
-                revelant_internal_txs_batch, ignore_conflicts=True
+                self.filter_relevant_txs(internal_txs), ignore_conflicts=True
             )
-            logger.debug("End storing of %d traces", traces_stored)
+            logger.debug("Stored %d traces", traces_stored)
 
             logger.debug("Start decoding and storing of decoded traces")
             #  Pass `tx_hashes` instead of `InternalTxs` to `_get_internal_txs_to_decode`
@@ -370,7 +395,7 @@ class InternalTxIndexerWithTraceBlock(InternalTxIndexer):
 
     def get_almost_updated_addresses(
         self, current_block_number: int
-    ) -> List[MonitoredAddress]:
+    ) -> set[ChecksumAddress]:
         """
         Return every address. As we are using `trace_block` every master copy should be processed together
 
@@ -381,11 +406,11 @@ class InternalTxIndexerWithTraceBlock(InternalTxIndexer):
 
     def find_relevant_elements(
         self,
-        addresses: Sequence[str],
+        addresses: set[ChecksumAddress],
         from_block_number: int,
         to_block_number: int,
         current_block_number: Optional[int] = None,
-    ) -> Dict[HexStr, FilterTrace]:
+    ) -> OrderedDict[bytes, FilterTrace]:
         return self._find_relevant_elements_using_trace_block(
             addresses, from_block_number, to_block_number
         )
